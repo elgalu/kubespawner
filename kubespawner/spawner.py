@@ -1803,6 +1803,7 @@ class KubeSpawner(Spawner):
         to_replace = '--hub-api-url="%s"' % (self.hub.api_url)
         for i in range(len(args)):
             if args[i] == to_replace:
+                self.accessible_hub_api_url = 'hub.jupyterns.svc.cluster.local'
                 args[i] = '--hub-api-url="%s"' % (self.accessible_hub_api_url)
                 break
         return args
