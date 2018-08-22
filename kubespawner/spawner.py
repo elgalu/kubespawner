@@ -1753,11 +1753,11 @@ class KubeSpawner(Spawner):
         delete_options = client.V1DeleteOptions()
 
         if now:
-            grace_seconds = 0
+            grace_seconds = 2
         else:
             # Give it some time, but not the default (which is 30s!)
             # FIXME: Move this into pod creation maybe?
-            grace_seconds = 1
+            grace_seconds = 5
 
         delete_options.grace_period_seconds = grace_seconds
         self.log.info("Deleting pod %s", self.pod_name)
@@ -1777,11 +1777,14 @@ class KubeSpawner(Spawner):
                 )
             else:
                 raise
+        
+        # Stop pod timeout should be a separate config from start_time
+        self.stop_timeout = 60
         try:
             yield exponential_backoff(
                 lambda: self.pod_reflector.pods.get(self.pod_name, None) is None,
-                'pod/%s did not disappear in %s seconds!' % (self.pod_name, self.start_timeout),
-                timeout=self.start_timeout,
+                'pod/%s did not disappear in %s seconds!' % (self.pod_name, self.stop_timeout),
+                timeout=self.stop_timeout,
             )
         except TimeoutError:
             self.log.error("Pod %s did not disappear, restarting pod reflector", self.pod_name)
