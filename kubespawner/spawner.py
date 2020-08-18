@@ -1995,9 +1995,14 @@ class KubeSpawner(Spawner):
         else:
             if slug:
                 # name specified, but not found
-                raise ValueError("No such profile: %s. Options include: %s" % (
+                # raise ValueError("No such profile: %s. Options include: %s" % (
+                #     slug, ', '.join(p['slug'] for p in self._profile_list)
+                # ))
+                # Do not raise and fail but log the error and keep going
+                self.log.error("fork: No such profile: %s. Options include: %s" % (
                     slug, ', '.join(p['slug'] for p in self._profile_list)
                 ))
+                profile = default_profile
             else:
                 # no name specified, use the default
                 profile = default_profile
