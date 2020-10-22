@@ -2,9 +2,59 @@
 
 <!-- PR link template: - [#](https://github.com/jupyterhub/kubespawner/pull/) ([@](https://github.com/)) -->
 
+## [0.14]
+
+### [0.14.0] - 2020-10-05
+
+#### Enhancements made
+* Allow image_pull_secrets config to be specified the k8s native way [#442](https://github.com/jupyterhub/kubespawner/pull/442) ([@consideRatio](https://github.com/consideRatio))
+
+#### Bugs fixed
+* Access containerStatuses key with get() [#441](https://github.com/jupyterhub/kubespawner/pull/441) ([@rmoe](https://github.com/rmoe))
+* Allow pod to spawn if the PVC specified already exists [#438](https://github.com/jupyterhub/kubespawner/pull/438) ([@gravenimage](https://github.com/gravenimage))
+* Add timeout and retry to create_namespaced_pod [#433](https://github.com/jupyterhub/kubespawner/pull/433) ([@gravenimage](https://github.com/gravenimage))
+* Fix KubeIngressProxy.get_all_routes for 0.13 [#430](https://github.com/jupyterhub/kubespawner/pull/430) ([@remche](https://github.com/remche))
+
+#### Maintenance and upkeep improvements
+* Manage regexp syntax deprecation [#445](https://github.com/jupyterhub/kubespawner/pull/445) ([@consideRatio](https://github.com/consideRatio))
+* Python 3.6+ migration: async in 3.5 and async with yeild in 3.6 [#444](https://github.com/jupyterhub/kubespawner/pull/444) ([@consideRatio](https://github.com/consideRatio))
+* Add an explicit dependency on urllib3 [#437](https://github.com/jupyterhub/kubespawner/pull/437) ([@yuvipanda](https://github.com/yuvipanda))
+* Delete remnant now unused parts in spawner.py [#382](https://github.com/jupyterhub/kubespawner/pull/382) ([@bitnik](https://github.com/bitnik))
+
+## [0.13]
+
+### [0.13.0] - 2020-09-XX
+
+Noteworthy for this release are: performance improvements, Kubernetes native environment variable specification, the possibility to run multiple JupyterHub's in the same namespace.
+
+#### Breaking changes
+
+The following changes probably won't break typical usage of KubeSpawner, but could for example break logic to customized the progress page JupyerHub displays while spawning a Kubernetes pod for the user.
+
+- The Kubernetes EventsReflector, which is providing the KubeSpawner instances with information about [Kubernetes Events](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.19/#event-v1-core) describing events for other resources, is now exposing events as python dictionaries rather than `V1Event` objects. `V1Event` is defined in the [kubernetes-client/python](https://github.com/jupyterhub/kubespawner) library as a representation of a Kubernetes Event.
+- KubeSpawner's `.progress` method implementation (https://github.com/jupyterhub/jupyterhub/pull/1771) which is generating a formatted `message` as well as a KubeSpawner specific `raw_event` entry now returns the `raw_event` as a Python dictionary with entries formatted in `camelCase` where the keys were formatted in `snake_case`.
+
+#### New
+* Support EnvVar's with 'valueFrom' as well as with 'value' [#426](https://github.com/jupyterhub/kubespawner/pull/426) ([@consideRatio](https://github.com/consideRatio))
+* Breaking change / performance: don't make kubernetes-client deserialize k8s events into objects [#424](https://github.com/jupyterhub/kubespawner/pull/424) ([@rmoe](https://github.com/rmoe))
+* Add component_label property to support multiple hub instances in the… [#418](https://github.com/jupyterhub/kubespawner/pull/418) ([@harsimranmaan](https://github.com/harsimranmaan))
+
+#### Fixes
+* Breaking change / performance: don't make kubernetes-client deserialize k8s events into objects [#424](https://github.com/jupyterhub/kubespawner/pull/424) ([@rmoe](https://github.com/rmoe))
+
+#### Maintenance
+* Log thread pool worker count on init [#420](https://github.com/jupyterhub/kubespawner/pull/420) ([@mriedem](https://github.com/mriedem))
+* CI: test k8s 1.18 and require success, publish without test, bump minikube [#417](https://github.com/jupyterhub/kubespawner/pull/417) ([@consideRatio](https://github.com/consideRatio))
+
+## Contributors to this release
+
+[@abinet](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Aabinet+updated%3A2020-07-17..2020-09-03&type=Issues) | [@chancez](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Achancez+updated%3A2020-07-17..2020-09-03&type=Issues) | [@consideRatio](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3AconsideRatio+updated%3A2020-07-17..2020-09-03&type=Issues) | [@harsimranmaan](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Aharsimranmaan+updated%3A2020-07-17..2020-09-03&type=Issues) | [@meeseeksmachine](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Ameeseeksmachine+updated%3A2020-07-17..2020-09-03&type=Issues) | [@mriedem](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Amriedem+updated%3A2020-07-17..2020-09-03&type=Issues) | [@rmoe](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Armoe+updated%3A2020-07-17..2020-09-03&type=Issues) | [@shenghu](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Ashenghu+updated%3A2020-07-17..2020-09-03&type=Issues) | [@welcome](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Awelcome+updated%3A2020-07-17..2020-09-03&type=Issues) | [@yuvipanda](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Ayuvipanda+updated%3A2020-07-17..2020-09-03&type=Issues) | [@zlanyi](https://github.com/search?q=repo%3Ajupyterhub%2Fkubespawner+involves%3Azlanyi+updated%3A2020-07-17..2020-09-03&type=Issues)
+
+This list of contributors were generated by [`github-activity`](https://github.com/executablebooks/github-activity) according to [these criteria](https://github-activity.readthedocs.io/en/latest/#how-does-this-tool-define-contributions-in-the-reports).
+
 ## [0.12]
 
-### [0.12.0] - 2020-07-XX
+### [0.12.0] - 2020-07-17
 
 #### Security
 

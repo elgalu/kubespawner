@@ -6,7 +6,8 @@ implementation that should be used by JupyterHub.
 """
 
 from functools import partial  # noqa
-from datetime import datetime
+from datetime import datetime, timedelta
+import asyncio
 import json
 import os
 import sys
@@ -42,8 +43,6 @@ from .clients import shared_client
 from kubespawner.traitlets import Callable
 from kubespawner.objects import make_pod, make_pvc
 from kubespawner.reflector import NamespacedResourceReflector
-from asyncio import sleep
-from async_generator import async_generator, yield_
 from slugify import slugify
 
 class PodReflector(NamespacedResourceReflector):
@@ -55,10 +54,7 @@ class PodReflector(NamespacedResourceReflector):
     """
     kind = 'pods'
     list_method_name = 'list_namespaced_pod'
-    # FUTURE: These labels are the selection labels for the PodReflector. We
-    # might want to support multiple deployments in the same namespace, so we
-    # would need to select based on additional labels such as `app` and
-    # `release`.
+    # The default component label can be over-ridden by specifying the component_label property
     labels = {
         'component': 'singleuser-server',
     }
@@ -66,9 +62,9 @@ class PodReflector(NamespacedResourceReflector):
     @property
     def pods(self):
         """
-        A dictionary of the python kubernetes client's representation of pods
-        for the namespace. The dictionary keys are the pod ids and the values
-        are the actual pod resource representations.
+        A dictionary of pods for the namespace as returned by the Kubernetes
+        API. The dictionary keys are the pod ids and the values are
+        dictionaries of the actual pod resource values.
 
         ref: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.16/#pod-v1-core
         """
@@ -88,7 +84,7 @@ class EventReflector(NamespacedResourceReflector):
     @property
     def events(self):
         """
-        Returns list of the python kubernetes client's representation of k8s
+        Returns list of dictionaries representing the k8s
         events within the namespace, sorted by the latest event.
 
         ref: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.16/#event-v1-core
@@ -101,12 +97,13 @@ class EventReflector(NamespacedResourceReflector):
         #   suddenly refreshes itself entirely. We should not assume a call to
         #   this dictionary's values will result in a consistently ordered list,
         #   so we sort it to get it somewhat more structured.
-        # - We either seem to get only event.last_timestamp or event.event_time,
-        #   both fields serve the same role but the former is a low resolution
-        #   timestamp without and the other is a higher resolution timestamp.
+        # - We either seem to get only event['lastTimestamp'] or
+        #   event['eventTime'], both fields serve the same role but the former
+        #   is a low resolution timestamp without and the other is a higher
+        #   resolution timestamp.
         return sorted(
             self.resources.values(),
-            key=lambda event: event.last_timestamp or event.event_time,
+            key=lambda event: event["lastTimestamp"] or event["eventTime"],
         )
 
 
@@ -206,6 +203,33 @@ class KubeSpawner(Spawner):
         Increase this if you are dealing with a very large number of users.
 
         Defaults to `5 * cpu_cores`, which is the default for `ThreadPoolExecutor`.
+        """
+    )
+
+    k8s_api_request_timeout = Integer(
+        3,
+        config=True,
+        help="""
+        API request timeout (in seconds) for all k8s API calls.
+
+        This is the total amount of time a request might take before the connection
+        is killed. This includes connection time and reading the response.
+
+        NOTE: This is currently only implemented for creation and deletion of pods,
+        and creation of PVCs.
+        """
+    )
+
+    k8s_api_request_retry_timeout = Integer(
+        30,
+        config=True,
+        help="""
+        Total timeout, including retry timeout, for kubernetes API calls
+
+        When a k8s API request connection times out, we retry it while backing
+        off exponentially. This lets you configure the total amount of time
+        we will spend trying an API request - including retries - before
+        giving up.
         """
     )
 
@@ -365,6 +389,16 @@ class KubeSpawner(Spawner):
         """
     )
 
+    component_label = Unicode(
+        'singleuser-server',
+        config=True,
+        help="""
+        The component label used to tag the user pods. This can be used to override
+        the spawner behavior when dealing with multiple hub instances in the same
+        namespace. Usually helpful for CI workflows.
+        """
+    )
+
     # FIXME: Don't override 'default_value' ("") or 'allow_none' (False) (Breaking change)
     hub_connect_ip = Unicode(
         allow_none=True,
@@ -479,22 +513,39 @@ class KubeSpawner(Spawner):
         """
     )
 
-    # FIXME: Don't override 'default_value' ("") or 'allow_none' (False) (Breaking change)
-    image_pull_secrets = Unicode(
-        None,
-        allow_none=True,
+    image_pull_secrets = Union(
+        trait_types=[
+            List(),
+            Unicode(),
+        ],
         config=True,
         help="""
-        The kubernetes secret to use for pulling images from private repository.
+        A list of references to Kubernetes Secret resources with credentials to
+        pull images from image registries. This list can either have strings in
+        it or objects with the string value nested under a name field.
 
-        Set this to the name of a Kubernetes secret containing the docker configuration
-        required to pull the image.
+        Passing a single string is still supported, but deprecated as of
+        KubeSpawner 0.14.0.
 
-        See `the Kubernetes documentation <https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod>`__
+        See `the Kubernetes documentation
+        <https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod>`__
         for more information on when and why this might need to be set, and what
         it should be set to.
         """
     )
+
+    @validate('image_pull_secrets')
+    def _validate_image_pull_secrets(self, proposal):
+        if type(proposal['value']) == str:
+            warnings.warn(
+                """Passing KubeSpawner.image_pull_secrets string values is
+                deprecated since KubeSpawner 0.14.0. The recommended
+                configuration is now a list of either strings or dictionary
+                objects with the string referencing the Kubernetes Secret name
+                in under the value of the dictionary's name key.""",
+                DeprecationWarning,
+            )
+            return [{"name": proposal['value']}]
 
     node_selector = Dict(
         config=True,
@@ -1201,7 +1252,7 @@ class KubeSpawner(Spawner):
         config=True,
         help="""
         Time in seconds for the pod to be in `terminating` state before is forcefully killed.
-        
+
         Increase this if you need more time to execute a `preStop` lifecycle hook.
 
         See https://kubernetes.io/docs/concepts/workloads/pods/pod/#termination-of-pods for
@@ -1371,7 +1422,7 @@ class KubeSpawner(Spawner):
     def _build_pod_labels(self, extra_labels):
         labels = self._build_common_labels(extra_labels)
         labels.update({
-            'component': 'singleuser-server'
+            'component': self.component_label
         })
         return labels
 
@@ -1386,28 +1437,27 @@ class KubeSpawner(Spawner):
         annotations.update(extra_annotations)
         return annotations
 
-    @gen.coroutine
-    def get_pod_manifest(self):
+    async def get_pod_manifest(self):
         """
         Make a pod manifest that will spawn current user's notebook pod.
         """
         if callable(self.uid):
-            uid = yield gen.maybe_future(self.uid(self))
+            uid = await gen.maybe_future(self.uid(self))
         else:
             uid = self.uid
 
         if callable(self.gid):
-            gid = yield gen.maybe_future(self.gid(self))
+            gid = await gen.maybe_future(self.gid(self))
         else:
             gid = self.gid
 
         if callable(self.fs_gid):
-            fs_gid = yield gen.maybe_future(self.fs_gid(self))
+            fs_gid = await gen.maybe_future(self.fs_gid(self))
         else:
             fs_gid = self.fs_gid
 
         if callable(self.supplemental_gids):
-            supplemental_gids = yield gen.maybe_future(self.supplemental_gids(self))
+            supplemental_gids = await gen.maybe_future(self.supplemental_gids(self))
         else:
             supplemental_gids = self.supplemental_gids
 
@@ -1425,7 +1475,7 @@ class KubeSpawner(Spawner):
             port=self.port,
             image=self.image,
             image_pull_policy=self.image_pull_policy,
-            image_pull_secret=self.image_pull_secrets,
+            image_pull_secrets=self.image_pull_secrets,
             node_selector=self.node_selector,
             run_as_uid=uid,
             run_as_gid=gid,
@@ -1492,10 +1542,10 @@ class KubeSpawner(Spawner):
         # FIXME: Validate if this is really the best way
         is_running = (
             pod is not None and
-            pod.status.phase == 'Running' and
-            pod.status.pod_ip is not None and
-            pod.metadata.deletion_timestamp is None and
-            all([cs.ready for cs in pod.status.container_statuses])
+            pod["status"]["phase"] == 'Running' and
+            pod["status"]["podIP"] is not None and
+            "deletionTimestamp" not in pod["metadata"] and
+            all([cs["ready"] for cs in pod["status"]["containerStatuses"]])
         )
         return is_running
 
@@ -1540,8 +1590,7 @@ class KubeSpawner(Spawner):
         if 'pod_name' in state:
             self.pod_name = state['pod_name']
 
-    @gen.coroutine
-    def poll(self):
+    async def poll(self):
         """
         Check if the pod is still running.
 
@@ -1556,23 +1605,23 @@ class KubeSpawner(Spawner):
         """
         # have to wait for first load of data before we have a valid answer
         if not self.pod_reflector.first_load_future.done():
-            yield self.pod_reflector.first_load_future
+            await self.pod_reflector.first_load_future
         data = self.pod_reflector.pods.get(self.pod_name, None)
         if data is not None:
-            if data.status.phase == 'Pending':
+            if data["status"]["phase"] == 'Pending':
                 return None
-            ctr_stat = data.status.container_statuses
+            ctr_stat = data["status"].get("containerStatuses")
             if ctr_stat is None:  # No status, no container (we hope)
                 # This seems to happen when a pod is idle-culled.
                 return 1
             for c in ctr_stat:
                 # return exit code if notebook container has terminated
-                if c.name == 'notebook':
-                    if c.state.terminated:
+                if c["name"] == 'notebook':
+                    if "terminated" in c["state"]:
                         # call self.stop to delete the pod
                         if self.delete_stopped_pods:
-                            yield self.stop(now=True)
-                        return c.state.terminated.exit_code
+                            await self.stop(now=True)
+                        return c["state"]["terminated"]["exitCode"]
                     break
             # None means pod is running or starting up
             return None
@@ -1596,11 +1645,11 @@ class KubeSpawner(Spawner):
 
         events = []
         for event in self.event_reflector.events:
-            if event.involved_object.name != self.pod_name:
+            if event["involvedObject"]["name"] != self.pod_name:
                 # only consider events for my pod name
                 continue
 
-            if self._last_event and event.metadata.uid == self._last_event:
+            if self._last_event and event["metadata"]["uid"]== self._last_event:
                 # saw last_event marker, ignore any previous events
                 # and only consider future events
                 # only include events *after* our _last_event marker
@@ -1609,7 +1658,7 @@ class KubeSpawner(Spawner):
                 events.append(event)
         return events
 
-    @async_generator
+
     async def progress(self):
         """
         This function is reporting back the progress of spawning a pod until
@@ -1624,7 +1673,6 @@ class KubeSpawner(Spawner):
 
         self.log.debug('progress generator: %s', self.pod_name)
         start_future = self._start_future
-        pod_id = None
         progress = 0
         next_event = 0
 
@@ -1638,11 +1686,6 @@ class KubeSpawner(Spawner):
 
             len_events = len(events)
             if next_event < len_events:
-                # only show messages for the 'current' pod
-                # pod_id may change if a previous pod is being stopped
-                # before starting a new one
-                # use the uid of the latest event to identify 'current'
-                pod_id = events[-1].involved_object.uid
                 for i in range(next_event, len_events):
                     event = events[i]
                     # move the progress bar.
@@ -1652,27 +1695,20 @@ class KubeSpawner(Spawner):
                     # 30 50 63 72 78 82 84 86 87 88 88 89
                     progress += (90 - progress) / 3
 
-                    # V1Event isn't serializable, and neither is the datetime
-                    # objects within it, and we need what we pass back to be
-                    # serializable to it can be sent back from JupyterHub to
-                    # a browser wanting to display progress.
-                    serializable_event = json.loads(
-                        json.dumps(event.to_dict(), default=datetime.isoformat)
-                    )
-                    await yield_({
+                    yield {
                         'progress': int(progress),
-                        'raw_event': serializable_event,
+                        'raw_event': event,
                         'message':  "%s [%s] %s" % (
-                            event.last_timestamp or event.event_time,
-                            event.type,
-                            event.message,
+                            event["lastTimestamp"] or event["eventTime"],
+                            event["type"],
+                            event["message"],
                         )
-                    })
+                    }
                 next_event = len_events
 
             if break_while_loop:
                 break
-            await sleep(1)
+            await asyncio.sleep(1)
 
     def _start_reflector(self, key, ReflectorClass, replace=False, **kwargs):
         """Start a shared reflector on the KubeSpawner class
@@ -1739,6 +1775,7 @@ class KubeSpawner(Spawner):
         If replace=True, a running pod reflector will be stopped
         and a new one started (for recovering from possible errors).
         """
+        PodReflector.labels.update({'component': self.component_label})
         return self._start_reflector("pods", PodReflector, replace=replace)
 
     # record a future for the call to .start()
@@ -1750,17 +1787,90 @@ class KubeSpawner(Spawner):
         start returns, which we can use to terminate
         .progress()
         """
-        self._start_future = self._start()
+        self._start_future = asyncio.ensure_future(self._start())
         return self._start_future
 
     _last_event = None
 
-    @gen.coroutine
-    def _start(self):
+    async def _make_create_pod_request(self, pod, request_timeout):
+        """
+        Make an HTTP request to create the given pod
+
+        Designed to be used with exponential_backoff, so returns
+        True / False on success / failure
+        """
+        try:
+            self.log.info(f"Attempting to create pod {pod.metadata.name}, with timeout {request_timeout}")
+            # Use tornado's timeout, _request_timeout seems unreliable?
+            await gen.with_timeout(timedelta(seconds=request_timeout), self.asynchronize(
+                self.api.create_namespaced_pod,
+                self.namespace,
+                pod,
+            ))
+            return True
+        except gen.TimeoutError:
+            # Just try again
+            return False
+        except ApiException as e:
+            pod_name = pod.metadata.name
+            if e.status != 409:
+                # We only want to handle 409 conflict errors
+                self.log.exception("Failed for %s", pod.to_str())
+                raise
+            self.log.info(f'Found existing pod {pod_name}, attempting to kill')
+            # TODO: this should show up in events
+            await self.stop(True)
+
+            self.log.info(f'Killed pod {pod_name}, will try starting singleuser pod again')
+            # We tell exponential_backoff to retry
+            return False
+
+    async def _make_create_pvc_request(self, pvc, request_timeout):
+        # Try and create the pvc. If it succeeds we are good. If
+        # returns a 409 indicating it already exists we are good. If
+        # it returns a 403, indicating potential quota issue we need
+        # to see if pvc already exists before we decide to raise the
+        # error for quota being exceeded. This is because quota is
+        # checked before determining if the PVC needed to be
+        # created.
+        pvc_name = pvc.metadata.name
+        try:
+            self.log.info(f"Attempting to create pvc {pvc.metadata.name}, with timeout {request_timeout}")
+            await gen.with_timeout(timedelta(seconds=request_timeout), self.asynchronize(
+                self.api.create_namespaced_persistent_volume_claim,
+                namespace=self.namespace,
+                body=pvc
+            ))
+            return True
+        except gen.TimeoutError:
+            # Just try again
+            return False
+        except ApiException as e:
+            if e.status == 409:
+                self.log.info("PVC " + pvc_name + " already exists, so did not create new pvc.")
+                return True
+            elif e.status == 403:
+                t, v, tb = sys.exc_info()
+
+                try:
+                    await self.asynchronize(
+                        self.api.read_namespaced_persistent_volume_claim,
+                        name=pvc_name,
+                        namespace=self.namespace)
+
+                except ApiException as e:
+                    raise v.with_traceback(tb)
+
+                self.log.info("PVC " + self.pvc_name + " already exists, possibly have reached quota though.")
+                return True
+            else:
+                raise
+
+    async def _start(self):
         """Start the user's pod"""
 
         # load user options (including profile)
-        yield self.load_user_options()
+        await self.load_user_options()
 
         # record latest event so we don't include old
         # events from previous pods in self.events
@@ -1769,75 +1879,31 @@ class KubeSpawner(Spawner):
         # pod if it's part of this spawn process
         events = self.events
         if events:
-            self._last_event = events[-1].metadata.uid
+            self._last_event = events[-1]["metadata"]["uid"]
 
         if self.storage_pvc_ensure:
-            # Try and create the pvc. If it succeeds we are good. If
-            # returns a 409 indicating it already exists we are good. If
-            # it returns a 403, indicating potential quota issue we need
-            # to see if pvc already exists before we decide to raise the
-            # error for quota being exceeded. This is because quota is
-            # checked before determining if the PVC needed to be
-            # created.
-
             pvc = self.get_pvc_manifest()
 
-            try:
-                yield self.asynchronize(
-                    self.api.create_namespaced_persistent_volume_claim,
-                    namespace=self.namespace,
-                    body=pvc
-                )
-            except ApiException as e:
-                if e.status == 409:
-                    self.log.info("PVC " + self.pvc_name + " already exists, so did not create new pvc.")
-
-                elif e.status == 403:
-                    t, v, tb = sys.exc_info()
-
-                    try:
-                        yield self.asynchronize(
-                            self.api.read_namespaced_persistent_volume_claim,
-                            name=self.pvc_name,
-                            namespace=self.namespace)
-
-                    except ApiException as e:
-                        raise v.with_traceback(tb)
-
-                    self.log.info("PVC " + self.pvc_name + " already exists, possibly have reached quota though.")
-
-                else:
-                    raise
-
+            # If there's a timeout, just let it propagate
+            await exponential_backoff(
+                partial(self._make_create_pvc_request, pvc, self.k8s_api_request_timeout),
+                f'Could not create pod {self.pvc_name}',
+                # Each req should be given k8s_api_request_timeout seconds.
+                timeout=self.k8s_api_request_retry_timeout
+            )
         # If we run into a 409 Conflict error, it means a pod with the
         # same name already exists. We stop it, wait for it to stop, and
         # try again. We try 4 times, and if it still fails we give up.
-        # FIXME: Have better / cleaner retry logic!
-        retry_times = 4
-        pod = yield self.get_pod_manifest()
+        pod = await self.get_pod_manifest()
         if self.modify_pod_hook:
-            pod = yield gen.maybe_future(self.modify_pod_hook(self, pod))
-        for i in range(retry_times):
-            try:
-                yield self.asynchronize(
-                    self.api.create_namespaced_pod,
-                    self.namespace,
-                    pod,
-                )
-                break
-            except ApiException as e:
-                if e.status != 409:
-                    # We only want to handle 409 conflict errors
-                    self.log.exception("Failed for %s", pod.to_str())
-                    raise
-                self.log.info('Found existing pod %s, attempting to kill', self.pod_name)
-                # TODO: this should show up in events
-                yield self.stop(True)
+            pod = await gen.maybe_future(self.modify_pod_hook(self, pod))
 
-                self.log.info('Killed pod %s, will try starting singleuser pod again', self.pod_name)
-        else:
-            raise Exception(
-                'Can not create user pod %s already exists & could not be deleted' % self.pod_name)
+        # If there's a timeout, just let it propagate
+        await exponential_backoff(
+            partial(self._make_create_pod_request, pod, self.k8s_api_request_timeout),
+            f'Could not create pod {self.pod_name}',
+            timeout=self.k8s_api_request_retry_timeout
+        )
 
         # we need a timeout here even though start itself has a timeout
         # in order for this coroutine to finish at some point.
@@ -1846,7 +1912,7 @@ class KubeSpawner(Spawner):
         # because the handler will have stopped waiting after
         # start_timeout, starting from a slightly earlier point.
         try:
-            yield exponential_backoff(
+            await exponential_backoff(
                 lambda: self.is_pod_running(self.pod_reflector.pods.get(self.pod_name, None)),
                 'pod/%s did not start in %s seconds!' % (self.pod_name, self.start_timeout),
                 timeout=self.start_timeout,
@@ -1863,22 +1929,51 @@ class KubeSpawner(Spawner):
             raise
 
         pod = self.pod_reflector.pods[self.pod_name]
-        self.pod_id = pod.metadata.uid
+        self.pod_id = pod["metadata"]["uid"]
         if self.event_reflector:
             self.log.debug(
                 'pod %s events before launch: %s',
                 self.pod_name,
                 "\n".join(
                     [
-                        "%s [%s] %s" % (event.last_timestamp or event.event_time, event.type, event.message)
+                        "%s [%s] %s" % (event["lastTimestamp"] or event["eventTime"], event["type"], event["message"])
                         for event in self.events
                     ]
                 ),
             )
-        return (pod.status.pod_ip, self.port)
+        return (pod["status"]["podIP"], self.port)
 
-    @gen.coroutine
-    def stop(self, now=False):
+    async def _make_delete_pod_request(self, pod_name, delete_options, grace_seconds, request_timeout):
+        """
+        Make an HTTP request to delete the given pod
+
+        Designed to be used with exponential_backoff, so returns
+        True / False on success / failure
+        """
+        self.log.info("Deleting pod %s", pod_name)
+        try:
+            await gen.with_timeout(timedelta(seconds=request_timeout), self.asynchronize(
+                self.api.delete_namespaced_pod,
+                name=pod_name,
+                namespace=self.namespace,
+                body=delete_options,
+                grace_period_seconds=grace_seconds,
+            ))
+            return True
+        except gen.TimeoutError:
+            return False
+        except ApiException as e:
+            if e.status == 404:
+                self.log.warning(
+                    "No pod %s to delete. Assuming already deleted.",
+                    pod_name,
+                )
+                # If there isn't already a pod, that's ok too!
+                return True
+            else:
+                raise
+
+    async def stop(self, now=False):
         delete_options = client.V1DeleteOptions()
 
         if now:
@@ -1887,25 +1982,16 @@ class KubeSpawner(Spawner):
             grace_seconds = self.delete_grace_period
 
         delete_options.grace_period_seconds = grace_seconds
-        self.log.info("Deleting pod %s", self.pod_name)
+
+
+        await exponential_backoff(
+            partial(self._make_delete_pod_request, self.pod_name, delete_options, grace_seconds, self.k8s_api_request_timeout),
+            f'Could not delete pod {self.pod_name}',
+            timeout=self.k8s_api_request_retry_timeout
+        )
+
         try:
-            yield self.asynchronize(
-                self.api.delete_namespaced_pod,
-                name=self.pod_name,
-                namespace=self.namespace,
-                body=delete_options,
-                grace_period_seconds=grace_seconds,
-            )
-        except ApiException as e:
-            if e.status == 404:
-                self.log.warning(
-                    "No pod %s to delete. Assuming already deleted.",
-                    self.pod_name,
-                )
-            else:
-                raise
-        try:
-            yield exponential_backoff(
+            await exponential_backoff(
                 lambda: self.pod_reflector.pods.get(self.pod_name, None) is None,
                 'pod/%s did not disappear in %s seconds!' % (self.pod_name, self.start_timeout),
                 timeout=self.start_timeout,
@@ -1926,9 +2012,8 @@ class KubeSpawner(Spawner):
         profile_form_template = Environment(loader=BaseLoader).from_string(self.profile_form_template)
         return profile_form_template.render(profile_list=self._profile_list)
 
-    @gen.coroutine
-    def _render_options_form_dynamically(self, current_spawner):
-        profile_list = yield gen.maybe_future(self.profile_list(current_spawner))
+    async def _render_options_form_dynamically(self, current_spawner):
+        profile_list = await gen.maybe_future(self.profile_list(current_spawner))
         profile_list = self._init_profile_list(profile_list)
         return self._render_options_form(profile_list)
 
@@ -1976,8 +2061,7 @@ class KubeSpawner(Spawner):
             'profile': formdata.get('profile', [None])[0]
         }
 
-    @gen.coroutine
-    def _load_profile(self, slug):
+    async def _load_profile(self, slug):
         """Load a profile by name
 
         Called by load_user_options
@@ -2029,8 +2113,7 @@ class KubeSpawner(Spawner):
 
         return profile_list
 
-    @gen.coroutine
-    def load_user_options(self):
+    async def load_user_options(self):
         """Load user options from self.user_options dict
 
         This can be set via POST to the API or via options_from_form
@@ -2041,7 +2124,7 @@ class KubeSpawner(Spawner):
 
         if self._profile_list is None:
             if callable(self.profile_list):
-                profile_list = yield gen.maybe_future(self.profile_list(self))
+                profile_list = await gen.maybe_future(self.profile_list(self))
             else:
                 profile_list = self.profile_list
 
@@ -2049,7 +2132,7 @@ class KubeSpawner(Spawner):
 
         selected_profile = self.user_options.get('profile', None)
         if self._profile_list:
-            yield self._load_profile(selected_profile)
+            await self._load_profile(selected_profile)
         elif selected_profile:
             self.log.warning("Profile %r requested, but profiles are not enabled", selected_profile)
 

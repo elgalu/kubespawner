@@ -11,11 +11,6 @@ import json
 import os
 import pytest
 
-def sync_wait(future):
-    loop = get_event_loop()
-    loop.run_until_complete(future)
-    return future.result()
-
 
 class MockUser(Mock):
     name = 'fake'
@@ -40,6 +35,7 @@ def test_deprecated_config():
         c.KubeSpawner.hub_connect_ip = '10.0.1.1'
         c.KubeSpawner.singleuser_extra_pod_config = extra_pod_config = {"key": "value"}
         c.KubeSpawner.image_spec = 'abc:123'
+        c.KubeSpawner.image_pull_secrets = 'k8s-secret-a'
         spawner = KubeSpawner(hub=Hub(), config=c, _mock=True)
         assert spawner.hub.connect_ip == '10.0.1.1'
         assert spawner.fs_gid == 10
@@ -48,6 +44,7 @@ def test_deprecated_config():
         assert spawner.singleuser_fs_gid == spawner.fs_gid
         assert spawner.singleuser_extra_pod_config == spawner.extra_pod_config
         assert spawner.image == 'abc:123'
+        assert spawner.image_pull_secrets[0]["name"] == 'k8s-secret-a'
 
 
 def test_deprecated_runtime_access():
@@ -65,6 +62,8 @@ def test_deprecated_runtime_access():
     spawner.image = 'abc:123'
     assert spawner.image_spec == 'abc:123'
     assert spawner.image == 'abc:123'
+    spawner.image_pull_secrets = 'k8s-secret-a'
+    assert spawner.image_pull_secrets[0]["name"] == 'k8s-secret-a'
 
 
 def test_spawner_values():
@@ -153,7 +152,8 @@ async def test_spawn_progress(kube_ns, kube_client, config):
     await spawner.stop()
 
 
-def test_get_pod_manifest_tolerates_mixed_input():
+@pytest.mark.asyncio
+async def test_get_pod_manifest_tolerates_mixed_input():
     """
     Test that the get_pod_manifest function can handle a either a dictionary or
     an object both representing V1Container objects and that the function
@@ -181,7 +181,7 @@ def test_get_pod_manifest_tolerates_mixed_input():
     spawner = KubeSpawner(config=c, _mock=True)
 
     # this test ensures the following line doesn't raise an error
-    manifest = sync_wait(spawner.get_pod_manifest())
+    manifest = await spawner.get_pod_manifest()
 
     # and tests the return value's types
     assert isinstance(manifest, V1Pod)

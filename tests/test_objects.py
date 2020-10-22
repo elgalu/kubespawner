@@ -137,7 +137,7 @@ def test_make_annotated_pod():
         "apiVersion": "v1"
     }
 
-def test_make_pod_with_image_pull_secrets():
+def test_make_pod_with_image_pull_secrets_simplified_format():
     """
     Test specification of the simplest possible pod specification
     """
@@ -147,7 +147,7 @@ def test_make_pod_with_image_pull_secrets():
         cmd=['jupyterhub-singleuser'],
         port=8888,
         image_pull_policy='IfNotPresent',
-        image_pull_secret='super-sekrit'
+        image_pull_secrets=["k8s-secret-a", "k8s-secret-b"],
     )) == {
         "metadata": {
             "name": "test",
@@ -157,7 +157,57 @@ def test_make_pod_with_image_pull_secrets():
         "spec": {
             'automountServiceAccountToken': False,
             "imagePullSecrets": [
-                {'name': 'super-sekrit'}
+                {"name": "k8s-secret-a"},
+                {"name": "k8s-secret-b"}
+            ],
+            "containers": [
+                {
+                    "env": [],
+                    "name": "notebook",
+                    "image": "jupyter/singleuser:latest",
+                    "imagePullPolicy": "IfNotPresent",
+                    "args": ["jupyterhub-singleuser"],
+                    "ports": [{
+                        "name": "notebook-port",
+                        "containerPort": 8888
+                    }],
+                    'volumeMounts': [],
+                    "resources": {
+                        "limits": {},
+                        "requests": {}
+                    }
+                }
+            ],
+            'restartPolicy': 'OnFailure',
+            'volumes': [],
+        },
+        "kind": "Pod",
+        "apiVersion": "v1"
+    }
+
+
+def test_make_pod_with_image_pull_secrets_k8s_native_format():
+    """
+    Test specification of the simplest possible pod specification
+    """
+    assert api_client.sanitize_for_serialization(make_pod(
+        name='test',
+        image='jupyter/singleuser:latest',
+        cmd=['jupyterhub-singleuser'],
+        port=8888,
+        image_pull_policy='IfNotPresent',
+        image_pull_secrets=[{"name": "k8s-secret-a"}, {"name": "k8s-secret-b"}],
+    )) == {
+        "metadata": {
+            "name": "test",
+            "annotations": {},
+            "labels": {},
+        },
+        "spec": {
+            'automountServiceAccountToken': False,
+            "imagePullSecrets": [
+                {"name": "k8s-secret-a"},
+                {"name": "k8s-secret-b"}
             ],
             "containers": [
                 {
@@ -397,7 +447,6 @@ def test_make_pod_resources_all():
         mem_limit='1Gi',
         mem_guarantee='512Mi',
         image_pull_policy='IfNotPresent',
-        image_pull_secret="myregistrykey",
         node_selector={"disk": "ssd"}
     )) == {
         "metadata": {
@@ -407,7 +456,6 @@ def test_make_pod_resources_all():
         },
         "spec": {
             'automountServiceAccountToken': False,
-            "imagePullSecrets": [{"name": "myregistrykey"}],
             "nodeSelector": {"disk": "ssd"},
             "containers": [
                 {
@@ -443,13 +491,30 @@ def test_make_pod_resources_all():
 
 def test_make_pod_with_env():
     """
-    Test specification of a pod with custom environment variables
+    Test specification of a pod with custom environment variables.
     """
     assert api_client.sanitize_for_serialization(make_pod(
         name='test',
         image='jupyter/singleuser:latest',
         env={
-            'TEST_KEY': 'TEST_VALUE'
+            'TEST_KEY_1': 'TEST_VALUE',
+            'TEST_KEY_2': {
+                'valueFrom': {
+                    'secretKeyRef': {
+                        'name': 'my-k8s-secret',
+                        'key': 'password',
+                    },
+                },
+            },
+            'TEST_KEY_NAME_IGNORED': {
+                'name': 'TEST_KEY_3',
+                'valueFrom': {
+                    'secretKeyRef': {
+                        'name': 'my-k8s-secret',
+                        'key': 'password',
+                    },
+                },
+            },
         },
         cmd=['jupyterhub-singleuser'],
         port=8888,
@@ -464,7 +529,30 @@ def test_make_pod_with_env():
             'automountServiceAccountToken': False,
             "containers": [
                 {
-                    "env": [{'name': 'TEST_KEY', 'value': 'TEST_VALUE'}],
+                    "env": [
+                        {
+                            'name': 'TEST_KEY_1',
+                            'value': 'TEST_VALUE',
+                        },
+                        {
+                            'name': 'TEST_KEY_2',
+                            'valueFrom': {
+                                'secretKeyRef': {
+                                    'name': 'my-k8s-secret',
+                                    'key': 'password',
+                                },
+                            },
+                        },
+                        {
+                            'name': 'TEST_KEY_3',
+                            'valueFrom': {
+                                'secretKeyRef': {
+                                    'name': 'my-k8s-secret',
+                                    'key': 'password',
+                                },
+                            },
+                        },
+                    ],
                     "name": "notebook",
                     "image": "jupyter/singleuser:latest",
                     "imagePullPolicy": "IfNotPresent",
@@ -822,7 +910,6 @@ def test_make_pod_with_extra_resources():
         mem_limit='1Gi',
         mem_guarantee='512Mi',
         image_pull_policy='IfNotPresent',
-        image_pull_secret="myregistrykey",
         node_selector={"disk": "ssd"}
     )) == {
         "metadata": {
@@ -832,7 +919,6 @@ def test_make_pod_with_extra_resources():
         },
         "spec": {
             'automountServiceAccountToken': False,
-            "imagePullSecrets": [{"name": "myregistrykey"}],
             "nodeSelector": {"disk": "ssd"},
             "containers": [
                 {
@@ -1535,10 +1621,16 @@ def test_make_ingress():
     """
     Test specification of the ingress objects
     """
+    labels={
+        'heritage': 'jupyterhub',
+        'component': 'singleuser-server',
+        'hub.jupyter.org/proxy-route': 'true'
+    }
     endpoint, service, ingress = api_client.sanitize_for_serialization(make_ingress(
         name='jupyter-test',
         routespec='/my-path',
         target='http://192.168.1.10:9000',
+        labels=labels,
         data={"mykey": "myvalue"}
     ))
 
